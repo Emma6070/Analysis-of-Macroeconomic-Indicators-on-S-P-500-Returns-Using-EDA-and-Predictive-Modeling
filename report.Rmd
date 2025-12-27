@@ -1,0 +1,604 @@
+---
+title: "Analysis of Macroeconomic Indicators on S&P 500 Returns Using EDA and Predictive Modeling"
+
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Executive Summary
+
+This analysis investigates the predictive relationship between monthly macroeconomic indicators and S&P 500 returns. 
+
+**Key Findings:**
+
+- Only PPI (r = -0.172, p = 0.014) and CPI (r = -0.169, p = 0.016) show reliable predictive relationship, where higher inflation precedes lower returns.
+
+- LASSO classification achieves AUC of 0.657, moderately better than random guessing but insufficient for tactical trading.
+
+- More complex model (XGBoost; AUC = 0.5) performs even worse, suggesting that the nature of the lagged monthly economic data itself imposes a constraint on predictive accuracy.
+
+- In conclusion, While inflation-return relationships exist, unexplained factors (geopolitical events, sentiment shifts) dominate short-term market movements.
+
+---
+
+# Introduction
+
+## Research Question
+1. What are the key relationships and correlational patterns between macroeconomic indicators and S&P 500 returns?
+2. Can a simple classification model effectively predict next-month market downturns using monthly macroeconomic indicators?
+
+## Motivation
+Monetary policy conditions and economic growth are the two main factors that impact stock market returns. If we can identify reliable economic indicators in these two fields that consistently affect the market, investors and policymakers can enhance their tactical asset allocation and improve risk management strategies according to the changes in these indicators. This report will focus on the S&P 500, a key benchmark for U.S. equities.
+
+## Challenges
+The challenges include handling the time-series nature of the data to ensure proper temporal alignment, addressing potential multicollinearity between economic indicators, and managing the class imbalance between market downturns and upturns in the training data during the predictive modeling phase.
+
+## Related works
+There are many existing works related to the questions. Firstly, the Fama-French multi-factor models, which employ factors that represent systematic economic risks to explain asset returns, support the idea of connecting macroeconomic indicators to stock market performance. Additionally, econometrics research have extensively examined the methodology of employing economic variables for predictive modelling. For instance, Chen, Roll, and Ross (1986) used multiple regression in Economic Forces and the Stock Market to show how macroeconomic factors impact stock returns. More recent research, such as Gu et al. (2020)'s Empirical Asset Pricing via Machine Learning, has used machine learning techniques to capture non-linear relationships between economic indicators and market movements.
+
+## Data & Methodology
+
+**Data Sources**: Economic Indicators are from Federal Reserve Economic Data (FRED) and S&P 500 historical prices are from investing.com. The dataset spans from July 2007 to June 2025 and provide 216 monthly observations. The model uses eight economic indicators-CPI, PPI, GDP, Payrolls, Unemployment, Federal Funds Rate, Yield Curve, and Real Rate-that reflect economic growth and monetary policy conditions. They work together to show the current state of the business cycle.  Inflation indicators (CPI and PPI) signal if the Fed will raise or lower interest rates, which affect equity valuations by changing the discount rate for future corporate earnings; growth indicators (GDP and Payrolls) show how much corporate profits could grow; labor market data (Unemployment) shows how much consumers can spend and how strong the economy is; and interest rate indicators (Federal Funds, Yield Curve, Real Rate) affect equity valuations as explained earlier.
+
+
+**Approach:**
+1. Exploratory correlation analysis 
+2. Indicator-specific deep dives
+3. Logistic regression with LASSO regularization
+4. XGBoost classification
+
+---
+
+# Methodology
+
+## Data Construction
+
+In order to analyze S&P 500 market returns, the data preparation pipeline loads several financial and economic datasets, standardizes their date formats, and produces a unified monthly dataset.  It calculates monthly S&P 500 returns, converts quarterly GDP data to monthly frequency, and merges all indicators. The pipeline then engineers derived features like yield curve spreads, inflation changes, and real interest rates.
+
+Models in this report uses year-over-year (YoY) percentage changes rather than raw values for CPI, PPI, GDP, and payroll because this transformation provides cleaner signals for market prediction.  YoY calculations remove seasonal fluctuations, create more stable time series, and focus on the rate of economic change, which is what financial markets actually respond to. YoY metrics are more economically significant for forecasting market movements because investors are more interested in whether inflation is increasing or decreasing (YoY change) than the absolute price level (raw CPI).
+
+In datasets, dates are aligned to first day of month for consistency. SP500_Price is Month-end closing price. Economic indicators are data for the entire month. Returns are Calculated from month-end to month-end prices.
+
+```{r}
+# Load required libraries
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(corrplot)
+library(caret)
+library(pROC)
+library(glmnet)
+library(PerformanceAnalytics)
+library(sandwich)
+library(lmtest)
+library(xgboost) 
+library(readr)
+```
+
+```{r}
+# Load data
+# Extract the entire ZIP 
+unzip("data.zip", exdir = ".")
+
+sp500    <- read_csv("data/S&P_500_Historical_Data.csv")
+cpi      <- read_csv("data/CPIAUCSL.csv")
+ppi      <- read_csv("data/PPIACO.csv")
+gdp      <- read_csv("data/GDP.csv")
+gs2      <- read_csv("data/GS2.csv")
+gs10     <- read_csv("data/GS10.csv")
+fedfunds <- read_csv("data/FEDFUNDS.csv")
+trade    <- read_csv("data/BOPGSTB.csv")
+payems   <- read_csv("data/PAYEMS.csv")
+unrate   <- read_csv("data/UNRATE.csv")
+
+# Standardize date formats
+sp500 <- sp500 |> mutate(Date = mdy(Date))
+cpi <- cpi |> mutate(observation_date = ymd(observation_date))
+ppi <- ppi |> mutate(observation_date = ymd(observation_date))
+gdp <- gdp |> mutate(observation_date = ymd(observation_date))
+gs2 <- gs2 |> mutate(observation_date = ymd(observation_date))
+gs10 <- gs10 |> mutate(observation_date = ymd(observation_date))
+fedfunds <- fedfunds |> mutate(observation_date = ymd(observation_date))
+trade <- trade |> mutate(observation_date = ymd(observation_date))
+payems <- payems |> mutate(observation_date = ymd(observation_date))
+unrate <- unrate |> mutate(observation_date = ymd(observation_date))
+
+# Create monthly S&P 500 returns
+sp500_monthly <- sp500 |>
+  arrange(Date) |>
+  mutate(Return = (Price / lag(Price) - 1) * 100) |>
+  select(Date, SP500_Price = Price, SP500_Return = Return)
+
+# 1. Create complete monthly sequence
+monthly_dates <- seq(floor_date(min(cpi$observation_date), "month"),
+                     ceiling_date(max(cpi$observation_date), "month")- days(1),
+                     by = "month")
+
+# 2. Join GDP to monthly dates, then fill monthly data with the GDP of their corresponding quarter
+gdp_monthly <- tibble(observation_date = monthly_dates) |>
+  left_join(gdp, by = "observation_date") |>
+  arrange(observation_date) |>
+  mutate(GDP = na.locf(GDP, na.rm = FALSE))  # fill quarterly values
+
+# Merge all data
+data_all <- sp500_monthly |>
+  left_join(cpi |> rename(CPI = CPIAUCSL), by = c("Date" = "observation_date")) |>
+  left_join(ppi |> rename(PPI = PPIACO), by = c("Date" = "observation_date")) |>
+  left_join(gdp_monthly, by = c("Date" = "observation_date")) |>
+  left_join(gs2 |> rename(GS2 = GS2), by = c("Date" = "observation_date")) |>
+  left_join(gs10 |> rename(GS10 = GS10), by = c("Date" = "observation_date")) |>
+  left_join(fedfunds |> rename(FedFunds = FEDFUNDS), by = c("Date" = "observation_date")) |>
+  left_join(trade |> rename(TradeBalance = BOPGSTB), by = c("Date" = "observation_date")) |>
+  left_join(payems |> rename(Payrolls = PAYEMS), by = c("Date" = "observation_date")) |>
+  left_join(unrate |> rename(Unemployment = UNRATE), by = c("Date" = "observation_date")) |>
+  arrange(Date) |>
+  
+  # Calculate derived indicators
+  mutate(
+    YieldCurve = GS10 - GS2,
+    RealRate = GS10 - (CPI / 100),  # Approximate real rate
+    # Year-over-year changes
+    CPI_YoY = (CPI / lag(CPI, 12) - 1) * 100,
+    PPI_YoY = (PPI / lag(PPI, 12) - 1) * 100,
+    GDP_YoY = (GDP / lag(GDP, 12) - 1) * 100,
+    Payrolls_YoY = (Payrolls / lag(Payrolls, 12) - 1) * 100
+  )
+
+
+```
+## Correlation Analysis
+
+I begin by analyzing the correlation between current macroeconomic indicators and the subsequent month's S&P 500 returns utilizing standardized data.  It checks to see if current economic conditions can predict how the market will do next month.  I use a time alignment method that lags all of the predictive variables by one month. This is because economic data is usually released with a one-month delay, and this alignment makes sure that there is no look-ahead bias:  I use data of month t-1 which is released in month t, such as economic indicators and market performance, to guess how the market will do at the end of month t.
+
+```{r}
+# Create features with consistent transformations 
+corr_data_predictive <- data_all |>
+  select(
+    Date, SP500_Return,
+    CPI_YoY, PPI_YoY, GDP_YoY,
+    YieldCurve, Unemployment, FedFunds,
+    Payrolls_YoY, RealRate
+  ) |>
+  mutate(
+    # economic indicators (lagged 1 month for data release lag)
+    CPI_YoY_available = lag(CPI_YoY, 1),
+    PPI_YoY_available = lag(PPI_YoY, 1),
+    GDP_YoY_available = lag(GDP_YoY, 1),
+    YieldCurve_available = lag(YieldCurve, 1),
+    Unemployment_available = lag(Unemployment, 1),
+    FedFunds_available = lag(FedFunds, 1),
+    Payrolls_YoY_available = lag(Payrolls_YoY, 1),
+    RealRate_available = lag(RealRate, 1),
+    
+    # previous month return
+    SP500_Return_available = lag(SP500_Return, 1),
+    
+    # Target: current month return
+    SP500_Return_current = SP500_Return
+  ) |>
+  select(
+    SP500_Return_current,
+    CPI_YoY_available, PPI_YoY_available, GDP_YoY_available, 
+    YieldCurve_available, Unemployment_available, 
+    FedFunds_available, Payrolls_YoY_available, RealRate_available, 
+    SP500_Return_available
+  ) |>
+  na.omit()
+
+# Standardize all variables
+corr_data_predictive_scaled <- corr_data_predictive |>
+  mutate(across(everything(), scale))
+
+# Check standardization
+cat("Standardization check (mean ~ 0, sd ~ 1):\n")
+print(sapply(corr_data_predictive_scaled[, -1], function(x) c(mean = mean(x), sd = sd(x))))
+
+# Correlation on standardized data
+corr_matrix_predictive <- cor(corr_data_predictive_scaled, use = "complete.obs")
+
+# Correlation plot
+corrplot(corr_matrix_predictive, method = "color", type = "upper", 
+         tl.cex = 0.7, tl.col = "black", tl.srt = 45,
+         title = "Predictive: Previous Month Indicators → Current Month Returns (Standardized)",
+         mar = c(0, 0, 2, 0))
+
+# Extract and sort correlations with target
+cor_predictive <- corr_matrix_predictive["SP500_Return_current", ]
+cor_predictive <- cor_predictive[names(cor_predictive) != "SP500_Return_current"]
+
+# Get top positive and negative predictors
+top_pos_predictive <- sort(cor_predictive, decreasing = TRUE)[1:5]
+top_neg_predictive <- sort(cor_predictive, decreasing = FALSE)[1:5]
+
+cat("\nTop 5 Positive Predictive Indicators:\n")
+print(round(top_pos_predictive, 3))
+
+cat("\nTop 5 Negative Predictive Indicators:\n")
+print(round(top_neg_predictive, 3))
+
+# Statistical significance
+cat("\nStatistical Significance (p-values):\n")
+for(var in names(cor_predictive)) {
+  test <- cor.test(corr_data_predictive_scaled[[var]], corr_data_predictive_scaled$SP500_Return_current)
+  if(abs(test$estimate) > 0.08) {  
+    cat(sprintf("%-25s: r = %.3f, p = %.4f\n", 
+                var, test$estimate, test$p.value))
+  }
+}
+
+```
+
+The results reveal distinct tiers of statistical significance among variables with meaningful correlation magnitudes (|r| > 0.08). The only statistically significant predictors at the conventional 95% confidence level (p < 0.05) are the inflation indicators: PPI (r = -0.172, p = 0.0144) and CPI (r = -0.169, p = 0.0159). This indicates that higher current inflation reliably precedes lower next-month stock returns, though each explains only about 3% of the return variance individually (r² ≈ 0.029), the remaining 97% might be driven by unmodeled factors—geopolitical events, shifts in investor sentiment, corporate earnings surprises, and liquidity conditions—that are not captured in monthly economic releases.
+
+Marginally significant at the 90% confidence level (p < 0.10) is Payrolls growth (r = -0.118, p = 0.0944), showing a negative relationship that approaches but does not meet the standard threshold for statistical significance.
+
+The other variables show either very small correlation magnitudes or large p-values, indicating no reliable predictive power in isolation.
+
+## Indicator-Specific Analysis
+
+This section does an analysis of indicators to see how two important inflation measures (PPI and CPI) chosen by correlation analysis can predict future S&P 500 returns.  I use a scatter plot with trend lines to show the relationship between inflation levels and returns for each indicator. I also use a time series overlay to compare the paths of inflation and stock returns over time. 
+
+I used indicators from correlation analysis instead of LASSO because correlation picks variables based on how they relate to the outcome on their own, while LASSO's coefficient shows how much each indicator adds to the model when all the other chosen features are already there. This makes LASSO not useful for figuring out what each indicator does.
+
+```{r}
+# Prepare clean data for analysis
+indicator_analysis_data <- data_all |>
+  select(Date, SP500_Return, CPI_YoY, PPI_YoY, GDP_YoY, 
+         YieldCurve, Unemployment, FedFunds, RealRate) |>
+  na.omit()
+
+cat("\nPRODUCER PRICE INDEX (PPI_YoY)\n")
+cat("correlation with next month return: r = -0.172, p = 0.0144 **\n")
+cat("interpretation: higher producer inflation → lower subsequent returns\n")
+cat("effect size: explains ~3.0% of return variance (r² = 0.0296)\n\n")
+
+# Scatter plot with trend
+indicator_analysis_data |>
+  ggplot(aes(x = PPI_YoY, y = SP500_Return)) +
+  geom_point(alpha = 0.5, color = "coral") +
+  geom_smooth(method = "loess", color = "darkred", se = TRUE, span = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+  labs(title = "PPI Year-over-Year vs S&P 500 Monthly Returns",
+       subtitle = "Statistically significant predictor (r = -0.172, p = 0.0144)",
+       x = "PPI YoY Change (%)", y = "Return (%)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size = 10))
+
+# Time series overlay
+indicator_analysis_data |>
+  ggplot(aes(x = Date)) +
+  geom_line(aes(y = PPI_YoY, color = "PPI YoY"), size = 1) +
+  geom_line(aes(y = SP500_Return, color = "S&P 500 Return"), size = 0.7, alpha = 0.7) +
+  scale_y_continuous(name = "PPI YoY (%)", sec.axis = sec_axis(~., name = "Return (%)")) +
+  scale_color_manual(values = c("PPI YoY" = "coral", "S&P 500 Return" = "steelblue")) +
+  labs(title = "Producer Price Inflation and S&P 500 Returns Over Time",
+       x = "Date", color = "Indicator") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+cat("CONSUMER PRICE INDEX (CPI_YoY) \n")
+cat("correlation with next month return: r = -0.169, p = 0.0159 **\n")
+cat("interpretation: higher consumer inflation → lower subsequent returns\n")
+cat("effect size: explains ~2.9% of return variance (r² = 0.0286)\n\n")
+
+# Scatter plot with trend
+indicator_analysis_data |>
+  ggplot(aes(x = CPI_YoY, y = SP500_Return)) +
+  geom_point(alpha = 0.5, color = "darkgreen") +
+  geom_smooth(method = "loess", color = "red", se = TRUE, span = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+  geom_vline(xintercept = 2, linetype = "dotted", color = "gray", alpha = 0.7) +
+  labs(title = "CPI Year-over-Year vs S&P 500 Monthly Returns",
+       subtitle = "Statistically significant predictor (r = -0.169, p = 0.0159)",
+       x = "CPI YoY Change (%)", y = "Return (%)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size = 10))
+
+# Time series overlay
+indicator_analysis_data |>
+  ggplot(aes(x = Date)) +
+  geom_line(aes(y = CPI_YoY, color = "CPI YoY"), size = 1) +
+  geom_line(aes(y = SP500_Return, color = "S&P 500 Return"), size = 0.7, alpha = 0.7) +
+  scale_y_continuous(name = "CPI YoY (%)", sec.axis = sec_axis(~., name = "Return (%)")) +
+  scale_color_manual(values = c("CPI YoY" = "darkgreen", "S&P 500 Return" = "steelblue")) +
+  labs(title = "Consumer Price Inflation and S&P 500 Returns Over Time",
+       x = "Date", color = "Indicator") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+My examination of the indicators indicates a negative correlation between inflation metrics and future S&P 500 returns.   The scatter plots for the PPI and CPI both show a curvilinear downward trend, as inflation goes up from negative to positive, returns go down from positive to negative.   This means that low inflation may be linked to good returns, while high inflation levels are linked to bad market performance.
+
+The overlays of the time series give us more information about this dynamic. Both PPI and CPI overlays show an opposite pattern.  For instance, when the S&P 500 returns cluster in negative territory, the CPI values are often above zero.  This relationship is especially obvious during times of economic instability, like the financial crisis and its aftermath from 2008 to 2010 and the recent inflation surge from 2022 to 2023.  During both of these times, there were drops in the market at the same time as consumer inflation rises, and vice versa.
+
+## LASSO Logistic Regression
+
+The LASSO Logistic Regression model automated feature selection via L1 regularization. This model aims to predict whether the S&P 500 will experience a negative monthly return ("downturn") using only economic and market data available at the time of prediction. Same as previous analysis, the design accounts for data release lags by using all indicators from the previous month to forecast the current month's market performance. I also add market performance variables (returns, momentum, and volatility) , and lag them by one month to ensure that only information available at the time of prediction is used.
+
+```{r}
+cat("approach: concurrent with data release lag adjustment\n")
+cat("target: current month downturn (return < 0%)\n")
+cat("features: previous month's released indicators (lagged 1 month)\n\n")
+
+classification_data <- data_all |>
+  select(
+    Date, CPI_YoY, PPI_YoY, GDP_YoY,
+    YieldCurve, Unemployment, FedFunds,
+    Payrolls_YoY, RealRate, SP500_Return
+  ) |>
+  mutate(
+    # target: current month downturn
+    Downturn_current = if_else(SP500_Return < 0, 1, 0),
+    
+    # technical indicators (lagged - can't know current month return yet)
+    SP500_Momentum_available = lag(SP500_Return, 1) - lag(SP500_Return, 2),
+    SP500_Volatility_available = rollapplyr(lag(SP500_Return, 1), width = 3, 
+                                            FUN = sd, fill = NA, align = "right"),
+    
+    # economic indicators (lagged 1 month for data release lag)
+    CPI_YoY_available = lag(CPI_YoY, 1),
+    PPI_YoY_available = lag(PPI_YoY, 1),
+    GDP_YoY_available = lag(GDP_YoY, 1),
+    YieldCurve_available = lag(YieldCurve, 1),
+    Unemployment_available = lag(Unemployment, 1),
+    FedFunds_available = lag(FedFunds, 1),
+    Payrolls_YoY_available = lag(Payrolls_YoY, 1),
+    RealRate_available = lag(RealRate, 1),
+    
+    # previous month return (realistic predictor)
+    SP500_Return_available = lag(SP500_Return, 1)
+  ) |>
+  na.omit() |>
+  mutate(Downturn_current = factor(Downturn_current, levels = c("0", "1")))
+
+cat("data prepared (with release lag adjustment):\n")
+cat("total observations:", nrow(classification_data), "\n")
+cat("target: current month downturn\n")
+cat("features: previous month's indicators + technical measures\n")
+cat("→ realistic: uses only data available when predicting\n\n")
+
+# class distribution
+class_dist <- classification_data |>
+  count(Downturn_current) |>
+  mutate(Percentage = n / sum(n) * 100)
+
+cat("class distribution:\n")
+print(class_dist)
+
+# train/test split
+split_date <- classification_data |>
+  pull(Date) |>
+  as.numeric() |>
+  quantile(0.8) |>
+  as.Date(origin = "1970-01-01")
+
+train_data <- classification_data |> filter(Date <= split_date)
+test_data <- classification_data |> filter(Date > split_date)
+
+cat("\ntraining period:", format(min(train_data$Date), "%Y-%m-%d"), "to",
+    format(max(train_data$Date), "%Y-%m-%d"), "\n")
+cat("testing period:", format(min(test_data$Date), "%Y-%m-%d"), "to",
+    format(max(test_data$Date), "%Y-%m-%d"), "\n\n")
+
+# prepare features
+features <- c("CPI_YoY_available", "PPI_YoY_available", "GDP_YoY_available", 
+              "YieldCurve_available", "Unemployment_available", 
+              "FedFunds_available", "Payrolls_YoY_available", "RealRate_available", 
+              "SP500_Return_available", "SP500_Momentum_available", 
+              "SP500_Volatility_available")
+
+X_train <- train_data |> select(all_of(features)) |> as.matrix()
+y_train <- train_data$Downturn_current
+
+X_test <- test_data |> select(all_of(features)) |> as.matrix()
+y_test <- test_data$Downturn_current
+
+# train lasso
+set.seed(42)
+
+cv_lasso <- cv.glmnet(X_train, y_train, 
+                      family = "binomial",
+                      alpha = 1,
+                      nfolds = 5,
+                      type.measure = "auc",
+                      standardize = TRUE)
+
+best_lambda <- cv_lasso$lambda.min
+cat("optimal lambda:", round(best_lambda, 5), "\n\n")
+
+plot(cv_lasso, main = "lasso cross-validation (auc)")
+
+# final model
+final_model <- glmnet(X_train, y_train, 
+                      family = "binomial",
+                      alpha = 1,
+                      lambda = best_lambda)
+
+# feature importance
+coefficients <- coef(final_model) |>
+  as.matrix() |>
+  as.data.frame() |>
+  rownames_to_column("Feature") |>
+  rename(Coefficient = s0) |>
+  filter(Coefficient != 0) |>
+  arrange(desc(abs(Coefficient)))
+
+cat("lasso selected features\n")
+cat("lasso selected", nrow(coefficients) - 1, "out of", length(features), "features:\n\n")
+print(coefficients)
+
+selected_features <- coefficients |> 
+  filter(Feature != "(Intercept)") |> 
+  pull(Feature)
+
+cat("positive coefficients (increase downturn risk):\n")
+pos_feats <- coefficients |> filter(Coefficient > 0, Feature != "(Intercept)")
+if (nrow(pos_feats) > 0) {
+  for (i in 1:nrow(pos_feats)) {
+    cat("  •", pos_feats$Feature[i], "(coef =", round(pos_feats$Coefficient[i], 4), ")\n")
+  }
+}
+
+cat("\nnegative coefficients (decrease downturn risk):\n")
+neg_feats <- coefficients |> filter(Coefficient < 0, Feature != "(Intercept)")
+if (nrow(neg_feats) > 0) {
+  for (i in 1:nrow(neg_feats)) {
+    cat("  •", neg_feats$Feature[i], "(coef =", round(neg_feats$Coefficient[i], 4), ")\n")
+  }
+}
+
+# model performance
+lasso_test_pred_prob <- predict(final_model, X_test, type = "response")[,1]
+lasso_test_roc <- roc(as.numeric(y_test) - 1, lasso_test_pred_prob)
+lasso_test_auc <- auc(lasso_test_roc)
+
+lasso_cm <- confusionMatrix(
+  factor(ifelse(lasso_test_pred_prob > 0.5, 1, 0), levels = c("0", "1")), 
+  y_test, positive = "1"
+)
+
+cat("lasso model performance (test set)\n")
+cat("auc:", round(lasso_test_auc, 3), "\n")
+cat("accuracy:", round(lasso_cm$overall["Accuracy"], 3), "\n")
+cat("precision:", round(lasso_cm$byClass["Precision"], 3), "\n")
+cat("recall:", round(lasso_cm$byClass["Recall"], 3), "\n\n")
+
+plot(lasso_test_roc, main = "lasso roc curve (test set)",
+     col = "blue", lwd = 2, legacy.axes = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "red")
+text(0.6, 0.2, paste("auc =", round(lasso_test_auc, 3)), col = "blue", cex = 1.2)
+
+```
+
+From the result, the model picked 9 out of 11 features and had moderate predictive power on the test set (February 2022 to June 2025), with an AUC of 0.645 and an accuracy of 63.4%.
+
+The cross-validation plot shows the AUC performance across different lambda values. The vertical dashed line marks the optimal lambda, which maximizes cross-validated AUC. The model peaks at this point, selecting 9 of 11 features. ROC Curve (Test Set): Plots true positive rate versus false positive rate. AUC of 0.645 (the blue line) indicates moderate predictive power, better than random (the red line) but not strong.
+
+This LASSO Logistic Regression model helps in studying both research quesions stated in section 2.1. 
+
+For the first research question, the model reveals several intuitive economic relationships. Based on the absolute magnitude of their coefficients, the most influential indicators in the LASSO model were the Federal Funds rate (negative relationship), CPI inflation (positive), real interest rates (positive), and GDP growth (negative). This suggests that when considered jointly, inflation, interest rate conditions, and economic growth are selected as the most relevant predictors, revealing relationships that differ from those observed in simple pairwise correlations. 
+
+According to the CPI_YoY_available positive coefficient (coef = 0.2984), there is a greater chance of a market downturn when inflation is higher. This is consistent with the expectation that inflation pressures may lead to tighter monetary policy. Similarly, RealRate_available (coef = 0.1993) shows that higher real interest rates also elevate downturn risk, reinforcing the link between tighter financial conditions and weaker equity performance. On the other hand, the model pinpoints elements that reduce the risk of a downturn. Most notably, FedFunds_available (coef = -0.3454) exhibits a strong negative relationship. This may seem counterintuitive, but it may reflect the particular test period (07/2022-06/2025), when markets saw rate hikes by the Federal Reserve as a proactive, confident response to robust economic conditions rather than a restrictive shock. Furthermore, as would be expected, a stronger economy, represented by GDP_YoY_available (coef = -0.1144), is associated with a lower likelihood of a downturn.
+
+In answering the second research question, the results suggest that a simple classification model might not be effective in predict next-month market downturns using current economic conditions. The LASSO model does only slightly better than the random classifier (AUC = 0.5) with an AUC of 0.645. The model's precision of 0.556 and recall of 0.312 show that it misses a lot of downturns and sets off a lot of false alarms. This means that the model is not a reliable standalone tactical forecasting tool for monthly market timing.  This moderate performance might mean that next month's market returns are affected by a lot of unforeseen factors that aren't shown by lagged macroeconomic indicators alone, like geopolitical events or changes in market sentiment, macroeconomic indicators operate at a slower frequency (monthly/quarterly releases) than market movements, or more sophisticated models are required for prediction purposes.
+
+
+## XGBoost model
+
+Since the LASSO model does not perform well in prediction, I will use XGBoost to see if a more sophisticated algorithm can better predict S&P 500 monthly downturns (negative returns) by using lagged macroeconomic indicators and market momentum data. This comparison will help us figure out if LASSO's poor performance is due to its simplicity and interpretability, or if it is because the features don't work well for prediction.
+
+```{r}
+set.seed(42)
+
+# Calculate class weights to handle imbalance
+pos_weight <- sum(as.numeric(y_train) == "0") / sum(as.numeric(y_train) == "1")
+
+xgb_train_matrix <- xgb.DMatrix(X_train, label = as.numeric(y_train) - 1)
+xgb_test_matrix <- xgb.DMatrix(X_test, label = as.numeric(y_test) - 1)
+
+# Train XGBoost with class weight balancing
+xgb_model <- xgboost(
+  data = xgb_train_matrix,
+  objective = "binary:logistic",
+  max_depth = 3,
+  eta = 0.05,
+  nrounds = 150,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  scale_pos_weight = pos_weight,
+  eval_metric = "auc",
+  verbose = 0
+)
+
+# Predictions
+xgb_test_pred_prob <- predict(xgb_model, xgb_test_matrix)
+xgb_test_roc <- roc(as.numeric(y_test) - 1, xgb_test_pred_prob)
+xgb_test_auc <- auc(xgb_test_roc)
+
+xgb_cm <- confusionMatrix(
+  factor(ifelse(xgb_test_pred_prob > 0.5, 1, 0), levels = c("0", "1")), 
+  y_test, positive = "1"
+)
+
+cat("--- XGBoost Performance (Test Set) ---\n")
+cat("auc:", round(xgb_test_auc, 3), "\n")
+cat("accuracy:", round(xgb_cm$overall["Accuracy"], 3), "\n")
+cat("precision:", round(xgb_cm$byClass["Precision"], 3), "\n")
+cat("recall:", round(xgb_cm$byClass["Recall"], 3), "\n\n")
+
+# Model Comparison
+cat("\n=== MODEL COMPARISON: LASSO vs XGBOOST ===\n\n")
+comparison_table <- data.frame(
+  Metric = c("AUC", "Accuracy", "Precision", "Recall"),
+  LASSO = c(
+    round(lasso_test_auc, 3),
+    round(lasso_cm$overall["Accuracy"], 3),
+    round(lasso_cm$byClass["Precision"], 3),
+    round(lasso_cm$byClass["Recall"], 3)
+  ),
+  XGBoost = c(
+    round(xgb_test_auc, 3),
+    round(xgb_cm$overall["Accuracy"], 3),
+    round(xgb_cm$byClass["Precision"], 3),
+    round(xgb_cm$byClass["Recall"], 3)
+  )
+)
+print(comparison_table)
+
+```
+
+The results are worse than the results of LASSO. The model has an AUC of 0.5 (basically random guessing), an accuracy of 61%, and a recall of 0%, which means it didn't find any true downturns in the test set.
+
+This poor performance combined with my LASSO model's modest AUC of 0.645 confirms that LASSO's underperformance is most likely attributable to the predictive quality of the features, rather than its inherent simplicity and emphasis on interpretability.
+
+---
+
+# Conclusions & Future Works
+
+This analysis aimed to address two questions in section 2.1 regarding the relationships between macroeconomic indicators and S&P 500 returns.
+
+In response to the first question, inflation is the most relevant economic indicator for short-term stock returns.  Both the CPI and the PPI showed statistically significant negative correlations with monthly returns that came after them. This means that higher inflation tends to come before lower market performance.  But they only account for about 3% of the monthly return variance.  The other 97% comes from factors that aren't shown in monthly economic indicators, such as changes in investor sentiment.  LASSO regression also chose the Federal Funds rate (negative relationship), CPI inflation (positive), real interest rates (positive), and GDP growth (negative) as important predictors when evaluated jointly. This showed more complex relationships than just simple pairwise correlations.
+
+On the second question, there are statistically significant relationships, but they don't show effective prediction ability for tactical (short-term) market timing.  The LASSO logistic regression model acheives a fair AUC of 0.645, which is better than random guessing but not good enough for making reliable predictions.  A more advanced method, XGBoost, does not demonstrate any better prediction power. This indicates that the constraints are not merely methodological but are more likely inherent to the data itself.
+
+In conclusion, this analysis indicates that macroeconomic factors, especially inflation, do affect equity market performance; however, their predictive capability for monthly returns is insufficient to justify tactical trading strategies that rely on forecasting the subsequent month's market performance.
+
+To advance this research, future works could concentrate on integrating more varied and higher-frequency data streams, transcending monthly macroeconomic indicators.  This would involve combining daily market data—such as Treasury yields, options-implied volatility, and sentiment indicators—to capture a more granular, real-time picture of the drivers behind short-term returns. Methodologically, ensemble methods that use rolling, regime-aware frameworks to combine macroeconomic, technical, and behavioral signals may make predictions more reliable in a wider range of market conditions. Finally, extending the forecast horizon to 3–6 months and synchronizing the modeling frequency with the slower rate of monthly macroeconomic data may uncover more enduring and actionable correlations for strategic (long-term) asset allocation.
+
+---
+
+# References
+
+Chen, N.-F., Roll, R., & Ross, S. A. (1986). Economic forces and the stock market. In *The Journal of Business* (Vols. 59–59, Issue 3, pp. 383–403). The University of Chicago Press. https://www.jstor.org/stable/2352710
+
+Gu, S., Kelly, B., & Xiu, D. (2020). Empirical Asset Pricing via Machine Learning. *The Review of Financial Studies*, *33*(5), 2223–2273. https://doi.org/10.1093/rfs/hhaa009
+
+---
+
+# Technical Appendix
+
+## Variable Definitions
+
+| Variable | Definition | Source |
+|----------|-----------|--------|
+| CPI_YoY | Consumer Price Index, year-over-year % change | FRED |
+| PPI_YoY | Producer Price Index, year-over-year % change | FRED |
+| GDP_YoY | Real GDP, year-over-year % change | FRED |
+| Unemployment | Unemployment rate (%) | FRED |
+| FedFunds | Federal Funds Rate (%) | FRED |
+| YieldCurve | 10Y - 2Y Treasury spread (%) | FRED |
+| RealRate | Approximate real rate (10Y nominal - CPI) | Calculated |
+| SP500_Return | S&P 500 historical Monthly return (%) | investing.com|
+
+---
