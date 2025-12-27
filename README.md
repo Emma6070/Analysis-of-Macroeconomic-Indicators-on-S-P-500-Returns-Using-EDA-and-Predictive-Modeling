@@ -8,4 +8,3 @@ This analysis investigates the predictive relationship between monthly macroecon
 3. Logistic regression with LASSO regularization
 4. XGBoost classification
 
-This repository contains files and code developed as part of a school project. It is **not** intended for professional or commercial purposes.
